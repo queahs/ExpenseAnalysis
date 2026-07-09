@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <title>Expense Column Builder</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <style>
   :root{
     --paper:#EDE8D8;
@@ -92,6 +93,37 @@
     color:var(--ledger-green);
     margin-top:10px;
   }
+
+  #pdfDropzone{
+    border:2px dashed var(--rule);
+    border-radius:3px;
+    padding:34px 20px;
+    text-align:center;
+    cursor:pointer;
+    transition:border-color .15s, background .15s;
+  }
+  #pdfDropzone.drag{border-color:var(--ledger-green); background:#E9E4CF;}
+  #pdfDropzone p{margin:6px 0; color:var(--ink-soft); font-size:14px;}
+  #pdfDropzone strong{color:var(--ink); font-size:16px;}
+  #pdfFileInput{display:none;}
+
+  .or-divider{
+    display:flex;
+    align-items:center;
+    text-align:center;
+    margin:18px 0;
+    color:var(--ink-soft);
+    font-family:var(--mono);
+    font-size:11px;
+    letter-spacing:.1em;
+    text-transform:uppercase;
+  }
+  .or-divider::before, .or-divider::after{
+    content:'';
+    flex:1;
+    border-bottom:1px solid var(--rule);
+  }
+  .or-divider span{padding:0 12px;}
 
   .status-line{
     font-family:var(--mono);
@@ -233,6 +265,15 @@
       <p>or click to browse &nbsp;·&nbsp; .xlsx only</p>
       <input type="file" id="fileInput" accept=".xlsx">
     </div>
+
+    <div class="or-divider"><span>or</span></div>
+
+    <div id="pdfDropzone">
+      <p><strong>Drop one or more monthly chambers-account PDFs here</strong></p>
+      <p>or click to browse &nbsp;·&nbsp; .pdf, multiple files at once</p>
+      <input type="file" id="pdfFileInput" accept=".pdf" multiple>
+    </div>
+
     <div class="filename" id="filenameLine"></div>
     <div class="status-line" id="statusLine"></div>
   </div>
@@ -276,6 +317,7 @@
       </div>
       <button class="accent" id="generateBtn">Generate &amp; download</button>
     </div>
+    <a id="downloadLink" class="hidden" download style="display:inline-block; margin-top:12px; font-family:var(--mono); font-size:12.5px; color:var(--ledger-green); text-decoration:underline;"></a>
   </div>
 
 </div>
@@ -311,12 +353,16 @@
       for(let c=range.s.c; c<=range.e.c; c++){
         const txt = getCellText(ws,r,c).toLowerCase();
         if(!txt) continue;
-        if(txt==='expense') expenseCol=c;
+        if(txt==='expense' || txt==='item' || txt==='particulars') expenseCol=c;
         else if(txt==='description') descCol=c;
         else if(txt.startsWith('net')) netCol=c;
         else if(txt==='date') dateCol=c;
       }
-      if(expenseCol>=0 && descCol>=0 && netCol>=0) return {headerRow:r, expenseCol, descCol, netCol, dateCol};
+      // Some sheets only have a single "Description" column doing double duty
+      // as the item/vendor field (no separate "Expense" column) — fall back to it.
+      if(descCol<0 && expenseCol>=0) descCol = expenseCol;
+      if(expenseCol<0 && descCol>=0) expenseCol = descCol;
+      if(descCol>=0 && netCol>=0) return {headerRow:r, expenseCol, descCol, netCol, dateCol};
     }
     return null;
   }
@@ -470,7 +516,217 @@
     toast('Saved rules cleared');
   });
 
-  // ---- file handling ----
+  // ---- PDF parsing (tuned to the "FCC Operations Limited" chambers-account template) ----
+
+  if(window.pdfjsLib){
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  }
+
+  function parseAmount(s){
+    s = s.trim();
+    let neg = false;
+    if(s.startsWith('(') && s.endsWith(')')){ neg = true; s = s.slice(1,-1); }
+    if(s.startsWith('-')){ neg = true; s = s.slice(1); }
+    const n = parseFloat(s.replace(/,/g,''));
+    return neg ? -n : n;
+  }
+  const AMOUNT_RE = /\(?-?[\d,]+\.\d{2}\)?/g;
+
+  async function pdfToLines(arrayBuffer){
+    const pdf = await pdfjsLib.getDocument({data: arrayBuffer}).promise;
+    const allLines = [];
+    for(let p=1; p<=pdf.numPages; p++){
+      const page = await pdf.getPage(p);
+      const tc = await page.getTextContent();
+      let currentY = null, currentRow = [];
+      for(const it of tc.items){
+        const y = Math.round(it.transform[5]);
+        if(currentY === null || Math.abs(y-currentY) > 3){
+          if(currentRow.length) allLines.push(currentRow.join(' ').replace(/\s+/g,' ').trim());
+          currentRow = [it.str];
+          currentY = y;
+        } else {
+          currentRow.push(it.str);
+        }
+      }
+      if(currentRow.length) allLines.push(currentRow.join(' ').replace(/\s+/g,' ').trim());
+    }
+    return allLines.filter(Boolean);
+  }
+
+  function extractRent(fullText){
+    const startIdx = fullText.indexOf('Payable re Chambers:');
+    const endIdx = fullText.indexOf('Expenses as above');
+    if(startIdx<0 || endIdx<0) return null;
+    const segment = fullText.slice(startIdx, endIdx);
+    const nums = segment.match(AMOUNT_RE) || [];
+    if(nums.length<3) return null;
+    return { net:parseAmount(nums[0]), vat:parseAmount(nums[1]), gross:parseAmount(nums[2]) };
+  }
+  function extractExpensesAboveNet(fullText){
+    const m = fullText.match(/Expenses as above\s+(\(?-?[\d,]+\.\d{2}\)?)/);
+    return m ? parseAmount(m[1]) : null;
+  }
+  function extractFees(lines, fullText){
+    const m = fullText.match(/Totals\s+(\(?-?[\d,]+\.\d{2}\)?)\s+(\(?-?[\d,]+\.\d{2}\)?)\s+(\(?-?[\d,]+\.\d{2}\)?)/);
+    if(!m) return null;
+    return { gross:parseAmount(m[1]), net:parseAmount(m[2]), vat:parseAmount(m[3]) };
+  }
+  function extractCategories(lines){
+    const cats = [];
+    for(let i=0;i<lines.length;i++){
+      if(/^\d{3,4}$/.test(lines[i])){
+        const name = lines[i+2];
+        if(!name) continue;
+        for(let j=i+3; j<Math.min(i+40, lines.length); j++){
+          if(lines[j].startsWith('Total:')){
+            const nums = lines[j].match(AMOUNT_RE) || [];
+            if(nums.length>=3){
+              cats.push({label:name, net:parseAmount(nums[0]), vat:parseAmount(nums[1]), gross:parseAmount(nums[2])});
+            }
+            break;
+          }
+        }
+      }
+    }
+    return cats;
+  }
+  function lastDayOfMonth(monthName, year){
+    const months = ['january','february','march','april','may','june','july','august','september','october','november','december'];
+    const idx = months.indexOf(monthName.toLowerCase());
+    if(idx<0) return null;
+    const d = new Date(parseInt(year,10), idx+1, 0);
+    const dd = String(d.getDate()).padStart(2,'0');
+    const mm = String(d.getMonth()+1).padStart(2,'0');
+    return `${dd}/${mm}/${d.getFullYear()}`;
+  }
+
+  async function parseKHStylePdf(file){
+    const buf = await file.arrayBuffer();
+    const lines = await pdfToLines(buf);
+    const fullText = lines.join('\n');
+
+    const monthYearMatch = fullText.match(/Chambers Account for ([A-Za-z]+) (\d{4})/);
+    const invoiceMatch = fullText.match(/Invoice Number:\s*(\S+)/);
+    const memberMatch = fullText.match(/Member:\s*([^\n]+?)(?:\s{2,}|$)/);
+    if(!monthYearMatch){
+      return {ok:false, fileName:file.name, error:'Could not find a "Chambers Account for <Month> <Year>" heading — is this the right template?'};
+    }
+    const month = monthYearMatch[1], year = monthYearMatch[2];
+    const date = lastDayOfMonth(month, year);
+    const invoice = invoiceMatch ? invoiceMatch[1] : '';
+    const member = memberMatch ? memberMatch[1].trim() : '';
+
+    const rent = extractRent(fullText);
+    const categories = extractCategories(lines);
+    const fees = extractFees(lines, fullText);
+    const expensesAboveNet = extractExpensesAboveNet(fullText);
+
+    const rows = [];
+    let flagged = false;
+    if(rent) rows.push({date, invoice, description:`Rent Fixed levy - ${month} ${year}`, net:rent.net, vat:rent.vat, gross:rent.gross});
+    categories.forEach(c=> rows.push({date, invoice, description:c.label, net:c.net, vat:c.vat, gross:c.gross}));
+
+    if(expensesAboveNet !== null){
+      const actualNet = rows.reduce((s,r)=>s+r.net, 0);
+      const diff = Math.round((expensesAboveNet - actualNet)*100)/100;
+      if(Math.abs(diff) > 0.01){
+        rows.push({date, invoice, description:'Unidentified adjustment (please check PDF)', net:diff, vat:0, gross:diff});
+        flagged = true;
+      }
+    }
+    if(fees) rows.push({date, invoice, description:'Fees', net:fees.net, vat:fees.vat, gross:fees.gross});
+
+    return {ok:true, fileName:file.name, month, year, invoice, member, rows, flagged};
+  }
+
+  function buildSyntheticSheet(allRows){
+    const newWb = XLSX.utils.book_new();
+    const aoa = [['Date','Invoice','Description','Net','VAT','Gross']];
+    allRows.forEach(r=> aoa.push([r.date, r.invoice, r.description, r.net, r.vat, r.gross]));
+    const totalRowIdx = aoa.length; // 0-indexed row for TOTAL, right after data
+    aoa.push([null, null, 'Total', null, null, null]);
+    const newWs = XLSX.utils.aoa_to_sheet(aoa);
+    const n = allRows.length;
+    newWs[XLSX.utils.encode_cell({r:totalRowIdx, c:3})] = {t:'n', f:`SUM(D2:D${n+1})`};
+    for(let r=1;r<=n;r++){
+      ['D','E','F'].forEach(col=>{
+        const ref = col+(r+1);
+        if(newWs[ref]) newWs[ref].z = '#,##0.00';
+      });
+    }
+    return {wb:newWb, ws:newWs, sheetName:'Chambers Account Summary'};
+  }
+
+  function attachSheet(newWb, newWs, sheetName){
+    XLSX.utils.book_append_sheet(newWb, newWs, sheetName);
+  }
+
+  async function handlePdfFiles(fileList){
+    const files = Array.from(fileList).filter(f=>/\.pdf$/i.test(f.name));
+    if(files.length===0) return;
+    document.getElementById('statusLine').innerHTML = `Reading ${files.length} PDF${files.length>1?'s':''}…`;
+    document.getElementById('groupsPanel').classList.add('hidden');
+
+    await loadRules();
+
+    const allRows = [];
+    const errors = [];
+    let flaggedCount = 0;
+    let memberName = '';
+    for(const file of files){
+      try{
+        const result = await parseKHStylePdf(file);
+        if(!result.ok){ errors.push(`${result.fileName}: ${result.error}`); continue; }
+        if(result.member) memberName = result.member;
+        if(result.flagged) flaggedCount++;
+        allRows.push(...result.rows);
+      }catch(err){
+        errors.push(`${file.name}: ${err.message || err}`);
+      }
+    }
+    if(allRows.length===0){
+      document.getElementById('statusLine').innerHTML = '<span class="warn">Could not extract any rows from those PDFs.'+(errors.length?' '+errors.join(' · '):'')+'</span>';
+      return;
+    }
+    // sort by date (dd/mm/yyyy)
+    allRows.sort((a,b)=>{
+      const [ad,am,ay]=a.date.split('/').map(Number), [bd,bm,by]=b.date.split('/').map(Number);
+      return new Date(ay,am-1,ad) - new Date(by,bm-1,bd);
+    });
+
+    const built = buildSyntheticSheet(allRows);
+    wb = built.wb; ws = built.ws; sheetName = built.sheetName;
+    attachSheet(wb, ws, sheetName);
+    header = {headerRow:0, expenseCol:2, descCol:2, netCol:3, dateCol:0};
+    const rowsList = allRows.map((_,i)=> i+1);
+    dataInfo = {dataStart:1, dataEnd:allRows.length, totalRow:allRows.length+1, rowsList};
+
+    originalFileName = (memberName ? memberName.replace(/[^\w \-]/g,'').trim() : 'chambers_account') + '.xlsx';
+
+    const rawGroups = buildGroups(ws, header, dataInfo, savedRules);
+    groups = consolidateByLabel(rawGroups);
+
+    const autoMatchedCount = groups.filter(g=>g.autoMatched).length;
+    document.getElementById('statusLine').innerHTML =
+      `Parsed <b>${files.length}</b> PDF${files.length>1?'s':''} · found <b>${allRows.length}</b> line items across <b>${groups.length}</b> initial groups` +
+      (autoMatchedCount ? ` (<b>${autoMatchedCount}</b> auto-matched from saved rules)` : '') + '.' +
+      (flaggedCount ? `<br><span class="warn">${flaggedCount} month(s) had an amount that didn't fully match a named category — added as "Unidentified adjustment (please check PDF)" so the totals still tie out. Worth a quick look.</span>` : '') +
+      (errors.length ? `<br><span class="warn">${errors.join('<br>')}</span>` : '');
+
+    renderGroups();
+    document.getElementById('groupsPanel').classList.remove('hidden');
+  }
+
+  const pdfDropzone = document.getElementById('pdfDropzone');
+  const pdfFileInput = document.getElementById('pdfFileInput');
+  pdfDropzone.addEventListener('click', ()=>pdfFileInput.click());
+  ['dragenter','dragover'].forEach(ev=>pdfDropzone.addEventListener(ev, e=>{e.preventDefault(); pdfDropzone.classList.add('drag');}));
+  ['dragleave','drop'].forEach(ev=>pdfDropzone.addEventListener(ev, e=>{e.preventDefault(); pdfDropzone.classList.remove('drag');}));
+  pdfDropzone.addEventListener('drop', e=>{ handlePdfFiles(e.dataTransfer.files); });
+  pdfFileInput.addEventListener('change', e=>{ handlePdfFiles(e.target.files); });
+
+  // ---- file handling (xlsx) ----
   const dropzone = document.getElementById('dropzone');
   const fileInput = document.getElementById('fileInput');
   dropzone.addEventListener('click', ()=>fileInput.click());
@@ -539,61 +795,79 @@
 
   // ---- generate ----
   document.getElementById('generateBtn').addEventListener('click', async ()=>{
-    if(!ws || groups.length===0) return;
+    if(!ws || groups.length===0){ toast('Load a file and review the groups first'); return; }
+    try{
+      const range = XLSX.utils.decode_range(ws['!ref']);
+      const startCol = range.e.c + 2; // leave one blank spacer column
+      const netLetter = colLetter(header.netCol+1);
+      const dataStart1 = dataInfo.dataStart+1;
+      const dataEnd1 = dataInfo.dataEnd+1;
+      const netCellRef = XLSX.utils.encode_cell({r:dataInfo.dataStart, c:header.netCol});
+      const netFmt = (ws[netCellRef]||{}).z || '#,##0.00';
 
-    const range = XLSX.utils.decode_range(ws['!ref']);
-    const startCol = range.e.c + 2; // leave one blank spacer column
-    const netLetter = colLetter(header.netCol+1);
-    const dataStart1 = dataInfo.dataStart+1;
-    const dataEnd1 = dataInfo.dataEnd+1;
-    const netCellRef = XLSX.utils.encode_cell({r:dataInfo.dataStart, c:header.netCol});
-    const netFmt = (ws[netCellRef]||{}).z || '#,##0.00';
-
-    groups.forEach((g,i)=>{
-      const c0 = startCol+i;
-      const headerRef = XLSX.utils.encode_cell({r:header.headerRow, c:c0});
-      ws[headerRef] = {t:'s', v:g.label};
-      const rowSet = new Set(g.rows);
-      for(const r of dataInfo.rowsList){
-        const ref = XLSX.utils.encode_cell({r,c:c0});
-        if(rowSet.has(r)) ws[ref] = {t:'n', f:`${netLetter}${r+1}`, z:netFmt};
-        else delete ws[ref];
-      }
-      if(dataInfo.totalRow!=null){
-        const letter = colLetter(c0+1);
-        ws[XLSX.utils.encode_cell({r:dataInfo.totalRow,c:c0})] = {t:'n', f:`SUM(${letter}${dataStart1}:${letter}${dataEnd1})`, z:netFmt, s:{font:{bold:true}}};
-      }
-    });
-
-    const checkCol0 = startCol + groups.length;
-    const firstLetter = colLetter(startCol+1);
-    const lastLetter = colLetter(startCol+groups.length);
-    ws[XLSX.utils.encode_cell({r:header.headerRow,c:checkCol0})] = {t:'s', v:'Check'};
-    for(const r of dataInfo.rowsList){
-      ws[XLSX.utils.encode_cell({r,c:checkCol0})] = {t:'n', f:`${netLetter}${r+1}-SUM(${firstLetter}${r+1}:${lastLetter}${r+1})`, z:'0.00'};
-    }
-
-    let maxRowUsed = range.e.r;
-    if(dataInfo.totalRow!=null){
-      ws[XLSX.utils.encode_cell({r:dataInfo.totalRow,c:checkCol0})] = {t:'n', f:`SUM(${colLetter(checkCol0+1)}${dataStart1}:${colLetter(checkCol0+1)}${dataEnd1})`, z:'0.00', s:{font:{bold:true}}};
-      const paymentsRow = dataInfo.totalRow + 3;
-      ws[XLSX.utils.encode_cell({r:paymentsRow, c:header.netCol})] = {t:'s', v:'# Payments'};
       groups.forEach((g,i)=>{
         const c0 = startCol+i;
-        const letter = colLetter(c0+1);
-        ws[XLSX.utils.encode_cell({r:paymentsRow, c:c0})] = {t:'n', f:`COUNTA(${letter}${dataStart1}:${letter}${dataEnd1})`};
+        const headerRef = XLSX.utils.encode_cell({r:header.headerRow, c:c0});
+        ws[headerRef] = {t:'s', v:g.label};
+        const rowSet = new Set(g.rows);
+        for(const r of dataInfo.rowsList){
+          const ref = XLSX.utils.encode_cell({r,c:c0});
+          if(rowSet.has(r)) ws[ref] = {t:'n', f:`${netLetter}${r+1}`, z:netFmt};
+          else delete ws[ref];
+        }
+        if(dataInfo.totalRow!=null){
+          const letter = colLetter(c0+1);
+          ws[XLSX.utils.encode_cell({r:dataInfo.totalRow,c:c0})] = {t:'n', f:`SUM(${letter}${dataStart1}:${letter}${dataEnd1})`, z:netFmt, s:{font:{bold:true}}};
+        }
       });
-      maxRowUsed = Math.max(maxRowUsed, paymentsRow);
+
+      const checkCol0 = startCol + groups.length;
+      const firstLetter = colLetter(startCol+1);
+      const lastLetter = colLetter(startCol+groups.length);
+      ws[XLSX.utils.encode_cell({r:header.headerRow,c:checkCol0})] = {t:'s', v:'Check'};
+      for(const r of dataInfo.rowsList){
+        ws[XLSX.utils.encode_cell({r,c:checkCol0})] = {t:'n', f:`${netLetter}${r+1}-SUM(${firstLetter}${r+1}:${lastLetter}${r+1})`, z:'0.00'};
+      }
+
+      let maxRowUsed = range.e.r;
+      if(dataInfo.totalRow!=null){
+        ws[XLSX.utils.encode_cell({r:dataInfo.totalRow,c:checkCol0})] = {t:'n', f:`SUM(${colLetter(checkCol0+1)}${dataStart1}:${colLetter(checkCol0+1)}${dataEnd1})`, z:'0.00', s:{font:{bold:true}}};
+        const paymentsRow = dataInfo.totalRow + 3;
+        ws[XLSX.utils.encode_cell({r:paymentsRow, c:header.netCol})] = {t:'s', v:'# Payments'};
+        groups.forEach((g,i)=>{
+          const c0 = startCol+i;
+          const letter = colLetter(c0+1);
+          ws[XLSX.utils.encode_cell({r:paymentsRow, c:c0})] = {t:'n', f:`COUNTA(${letter}${dataStart1}:${letter}${dataEnd1})`};
+        });
+        maxRowUsed = Math.max(maxRowUsed, paymentsRow);
+      }
+
+      const newRange = {s:{r:range.s.r,c:range.s.c}, e:{r:maxRowUsed, c:checkCol0}};
+      ws['!ref'] = XLSX.utils.encode_range(newRange);
+
+      await persistRules();
+
+      const base = originalFileName.replace(/\.xlsx$/i,'');
+      const filename = `${base} (split).xlsx`;
+
+      // Build as a Blob + real <a download> link rather than XLSX.writeFile's
+      // auto-triggered download, which sandboxed iframes can silently block
+      // with no error at all.
+      const wbout = XLSX.write(wb, {bookType:'xlsx', type:'array'});
+      const blob = new Blob([wbout], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+      const url = URL.createObjectURL(blob);
+      const link = document.getElementById('downloadLink');
+      link.href = url;
+      link.download = filename;
+      link.textContent = `⬇ Download "${filename}"`;
+      link.classList.remove('hidden');
+      link.click();
+      toast('Ready — click the link below if the download didn\'t start automatically');
+    }catch(err){
+      console.error(err);
+      toast('Something went wrong generating the file — see console for details');
+      document.getElementById('statusLine').innerHTML += `<br><span class="warn">Generate failed: ${(err && err.message) || err}</span>`;
     }
-
-    const newRange = {s:{r:range.s.r,c:range.s.c}, e:{r:maxRowUsed, c:checkCol0}};
-    ws['!ref'] = XLSX.utils.encode_range(newRange);
-
-    await persistRules();
-
-    const base = originalFileName.replace(/\.xlsx$/i,'');
-    XLSX.writeFile(wb, `${base} (split).xlsx`);
-    toast('Downloaded — rules saved for next time');
   });
 
 })();
