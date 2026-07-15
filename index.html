@@ -681,6 +681,38 @@
     return null;
   }
 
+  // The "Individual Expenditure of Member" list on page 1 can hold any number
+  // of arbitrarily-named items (Books, insurance, practising certificate,
+  // sandwiches, etc.) and their labels often wrap across lines in that
+  // narrow column, making them unreliable to split out individually there.
+  // Page 2's "Individual Expenditure Charged on Invoice" section repeats the
+  // same figures as clean numbered blocks (a 3-4 digit code, then the
+  // category name on its own line, then a "Total: <amount> <vat>" line) —
+  // this is far more reliable to parse, so pull categories from there.
+  function extractIndividualExpenditureCategories(lines){
+    const cats = [];
+    const startIdx = lines.findIndex(l => l.includes('Individual Expenditure Charged on Invoice'));
+    if(startIdx<0) return cats;
+    const endIdx = lines.findIndex((l,idx)=> idx>startIdx && l.includes('Overall Total Charged On Invoice'));
+    const scanEnd = endIdx>=0 ? endIdx : lines.length;
+    for(let i=startIdx; i<scanEnd; i++){
+      if(/^\d{3,4}$/.test(lines[i].trim())){
+        const name = (lines[i+2]||'').trim();
+        if(!name) continue;
+        for(let j=i+3; j<Math.min(i+40, scanEnd); j++){
+          if(lines[j].trim().startsWith('Total:')){
+            const nums = (lines[j].match(AMOUNT_RE)||[]).map(parseAmount);
+            if(nums.length>=2){
+              cats.push({label:name, net:nums[0], vat:nums[1], gross:Math.round((nums[0]+nums[1])*100)/100});
+            }
+            break;
+          }
+        }
+      }
+    }
+    return cats;
+  }
+
   async function parse20EssexPdf(file){
     const buf = await file.arrayBuffer();
     const lines = await pdfToLines(buf);
@@ -719,6 +751,9 @@
 
     const loan = findAmountsNearLabel(lines, 'Loan Repayment');
     if(loan) rows.push({date, invoice, description:'Loan Repayment', net:loan.net, vat:loan.vat, gross:Math.round((loan.net+loan.vat)*100)/100});
+
+    const expenditureCategories = extractIndividualExpenditureCategories(lines);
+    expenditureCategories.forEach(c=> rows.push({date, invoice, description:c.label, net:c.net, vat:c.vat, gross:c.gross}));
 
     const fee = findAmountsNearLabel(lines, 'This Period');
     if(fee){
