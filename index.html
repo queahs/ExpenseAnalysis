@@ -640,6 +640,124 @@
     return {ok:true, fileName:file.name, month, year, invoice, member, rows, flagged};
   }
 
+  // ---- PDF parsing #2 (tuned to the "20 Essex Street" member-invoice template:
+  //      "Payable Re Chambers:" / "Individual Expenditure of Member:" two-column layout) ----
+
+  function extractSegment(text, startLabel, endLabel){
+    const si = text.indexOf(startLabel);
+    if(si<0) return '';
+    const rest = text.slice(si+startLabel.length);
+    if(!endLabel) return rest;
+    const ei = rest.indexOf(endLabel);
+    return ei>=0 ? rest.slice(0, ei) : rest;
+  }
+
+  // In this template numbers frequently land BEFORE their label on the same
+  // text line (or on the line just after, if a label wraps), rather than
+  // after it — e.g. "51.03 Contribution 12.6% 10.21" or "2,972.59 Rent
+  // quarterly in" / "advance" / "594.52". So rather than assuming
+  // label-then-numbers order, find the label's line and collect amounts
+  // from that line first, then a couple of lines after it, in the order
+  // they're encountered.
+  function findAmountsNearLabel(lines, labelSubstr, lookahead=4){
+    const idx = lines.findIndex(l => l.includes(labelSubstr));
+    if(idx<0) return null;
+    let collected = (lines[idx].match(AMOUNT_RE)||[]).map(parseAmount);
+    for(let j=idx+1; collected.length<2 && j<Math.min(idx+1+lookahead, lines.length); j++){
+      collected.push(...(lines[j].match(AMOUNT_RE)||[]).map(parseAmount));
+    }
+    if(collected.length<2) return null;
+    return { net: collected[0], vat: collected[1] };
+  }
+  function findFirstAmountNearLabel(lines, labelSubstr, lookahead=2){
+    const idx = lines.findIndex(l => l.includes(labelSubstr));
+    if(idx<0) return null;
+    const self = (lines[idx].match(AMOUNT_RE)||[]).map(parseAmount);
+    if(self.length) return self[0];
+    for(let j=idx+1; j<Math.min(idx+1+lookahead, lines.length); j++){
+      const a = (lines[j].match(AMOUNT_RE)||[]).map(parseAmount);
+      if(a.length) return a[0];
+    }
+    return null;
+  }
+
+  async function parse20EssexPdf(file){
+    const buf = await file.arrayBuffer();
+    const lines = await pdfToLines(buf);
+    const fullTextNL = lines.join('\n');
+    const fullText = lines.join(' ').replace(/\s+/g,' ').trim();
+
+    if(!fullText.includes('Payable Re Chambers') || !fullText.includes('Individual Expenditure of Member')){
+      return {ok:false, fileName:file.name, error:'Not a "20 Essex Street" member-invoice template (missing "Payable Re Chambers" / "Individual Expenditure of Member" headings).'};
+    }
+
+    const invoiceMatch = fullText.match(/Invoice Number:\s*(\S+)/);
+    const dateMatch = fullText.match(/Invoice Date\s*(\d{2}\/\d{2}\/\d{4})/);
+    const memberMatch = fullTextNL.match(/Member:\s*([^\n]+?)(?:\s{2,}|$)/m);
+
+    if(!dateMatch){
+      return {ok:false, fileName:file.name, error:'Recognized the 20 Essex Street template but could not find an Invoice Date.'};
+    }
+
+    const invoice = invoiceMatch ? invoiceMatch[1] : '';
+    const member = memberMatch ? memberMatch[1].trim() : '';
+    const date = dateMatch[1];
+    const [, mm, yyyy] = date.split('/');
+    const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+    const month = monthNames[parseInt(mm,10)-1];
+    const year = yyyy;
+
+    const rows = [];
+
+    const contribution = findAmountsNearLabel(lines, 'Contribution');
+    if(contribution){
+      rows.push({date, invoice, description:'Contribution', net:contribution.net, vat:contribution.vat, gross: Math.round((contribution.net+contribution.vat)*100)/100});
+    }
+
+    const rent = findAmountsNearLabel(lines, 'Rent quarterly');
+    if(rent) rows.push({date, invoice, description:'Rent quarterly in advance', net:rent.net, vat:rent.vat, gross:Math.round((rent.net+rent.vat)*100)/100});
+
+    const loan = findAmountsNearLabel(lines, 'Loan Repayment');
+    if(loan) rows.push({date, invoice, description:'Loan Repayment', net:loan.net, vat:loan.vat, gross:Math.round((loan.net+loan.vat)*100)/100});
+
+    const fee = findAmountsNearLabel(lines, 'This Period');
+    if(fee){
+      rows.push({date, invoice, description:'Fees', net:fee.net, vat:fee.vat, gross:Math.round((fee.net+fee.vat)*100)/100});
+    }
+
+    // Reconciliation against the invoice's own "Expenses as above" net figure
+    // (Contribution + Rent + Loan Repayment, excluding the Fees/income row).
+    let flagged = false;
+    const expensesAboveNet = findFirstAmountNearLabel(lines, 'Expenses as above');
+    if(expensesAboveNet !== null){
+      const expenseRowsNet = rows.filter(r=>r.description!=='Fees').reduce((s,r)=>s+r.net,0);
+      const diff = Math.round((expensesAboveNet - expenseRowsNet)*100)/100;
+      if(Math.abs(diff) > 0.01){
+        rows.push({date, invoice, description:'Unidentified adjustment (please check PDF)', net:diff, vat:0, gross:diff});
+        flagged = true;
+      }
+    }
+
+    if(rows.length===0){
+      return {ok:false, fileName:file.name, error:'Recognized the 20 Essex Street template but could not extract any line items from it.'};
+    }
+
+    return {ok:true, fileName:file.name, month, year, invoice, member, rows, flagged};
+  }
+
+  // Tries each known chambers-invoice template in turn and returns whichever matches.
+  async function parseChambersPdf(file){
+    const khResult = await parseKHStylePdf(file);
+    if(khResult.ok) return khResult;
+    const essexResult = await parse20EssexPdf(file);
+    if(essexResult.ok) return essexResult;
+    return {
+      ok:false,
+      fileName:file.name,
+      error:`Didn't match a known chambers-invoice template (FCC-style: ${khResult.error || 'no match'} · 20 Essex-style: ${essexResult.error || 'no match'})`
+    };
+  }
+
   function buildSyntheticSheet(allRows){
     const newWb = XLSX.utils.book_new();
     const aoa = [['Date','Invoice','Description','Net','VAT','Gross']];
@@ -676,7 +794,7 @@
     let memberName = '';
     for(const file of files){
       try{
-        const result = await parseKHStylePdf(file);
+        const result = await parseChambersPdf(file);
         if(!result.ok){ errors.push(`${result.fileName}: ${result.error}`); continue; }
         if(result.member) memberName = result.member;
         if(result.flagged) flaggedCount++;
